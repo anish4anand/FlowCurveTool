@@ -1,0 +1,20 @@
+# Ignore compiled Python files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Ignore virtual environments
+venv/
+.env/
+
+# Ignore generated results
+results/
+*.csv
+*.xlsx
+
