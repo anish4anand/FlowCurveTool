@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QFileDialog, QMessageBox, QLabel, QListWidget, QTableWidget,
-    QTableWidgetItem, QComboBox
+    QTableWidgetItem, QComboBox, QDialog
 )
 
 from dialogs import GeometryDialog
@@ -106,7 +106,7 @@ class DataOptimizer(QMainWindow):
                 raise ValueError("CSV must have at least 2 columns (x, y).")
 
             dialog = GeometryDialog(self)
-            if dialog.exec() == dialog.Accepted:
+            if dialog.exec() == QDialog.Accepted:
                 diameter, height = dialog.get_values()
                 if diameter is None or height is None:
                     QMessageBox.warning(self, "Error", "Please enter valid numbers!")
@@ -218,7 +218,7 @@ class DataOptimizer(QMainWindow):
             return
         ds = self.datasets[self.current_index]
         dialog = GeometryDialog(self, ds["diameter"], ds["height"])
-        if dialog.exec() == dialog.Accepted:
+        if dialog.exec() == QDialog.Accepted:
             diameter, height = dialog.get_values()
             if diameter is None or height is None:
                 QMessageBox.warning(self, "Error", "Please enter valid numbers!")
@@ -252,13 +252,20 @@ class DataOptimizer(QMainWindow):
             return
 
         fig, axes = plt.subplots(2, 1, figsize=(8, 10), sharex=True)
+
+    # --- Flow stress ---
         for ds in processed:
             data = ds["proc_data"]
-            axes[0].plot(data["x"], data["y"], label=f"{ds['filename']}")
+            axes[0].plot(data["x"], data["y"], label=ds["filename"])
         axes[0].set_ylabel("Flow Stress [MPa]")
+    # Auto-scale x-axis to match data range
+        max_x = max(ds["proc_data"]["x"].max() for ds in processed)
+        axes[0].set_xlim([0, max_x * 1.02])
+        axes[1].set_xlim([0, max_x * 1.02])
         axes[0].legend()
         axes[0].grid(True)
 
+    # --- Temperature ---
         has_temp = any("temperature" in ds["proc_data"].columns for ds in processed)
         if has_temp:
             for ds in processed:
@@ -267,14 +274,17 @@ class DataOptimizer(QMainWindow):
                     axes[1].plot(data["x"], data["temperature"], label=ds["filename"])
             axes[1].set_ylabel("Temperature [°C]")
             axes[1].set_xlabel("Strain [-]")
+            axes[1].set_xlim([0, 1.3])  # ← restore x-axis limits
+            axes[1].set_ylim([0, 800])  # ← restore y-axis limits
             axes[1].legend()
             axes[1].grid(True)
         else:
-            axes[1].set_visible(False)
+            #axes[1].set_visible(False)
+            axes[1].text(0.5, 0.5, "No temperature data found",
+                 ha="center", va="center", transform=axes[1].transAxes)
 
         plt.tight_layout()
         plt.show()
-
     # -------------------- Export --------------------
     def export_results(self):
         processed = [ds for ds in self.datasets if ds["preprocessed"]]
