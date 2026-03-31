@@ -2,8 +2,12 @@ import sys
 from PySide6.QtWidgets import QApplication
 from gui_mainwindow import DataOptimizer
 
-if __name__ == "__main__":
+def main():
     app = QApplication(sys.argv)
-    window = DataOptimizer()
-    window.show()
+    w = DataOptimizer()
+    w.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
