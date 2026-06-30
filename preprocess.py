@@ -2,33 +2,27 @@ import numpy as np
 import math
 import pandas as pd
 from scipy import interpolate as interp
+from scipy.signal import savgol_filter
 
-from filters import apply_filter
 from utils import apply_offset_to_flow, detect_end_index
 
+def safe_savgol(y_data, default_window, polyorder=2):
+    """
+    Safely applies the Savitzky-Golay filter.
+    Dynamically shrinks the window if the dataset is too small to prevent crashes.
+    """
+    if len(y_data) <= polyorder + 1:
+        return y_data
+    
+    w_len = min(default_window, len(y_data))
+    if w_len % 2 == 0:
+        w_len -= 1
+        
+    return savgol_filter(y_data, window_length=w_len, polyorder=polyorder)
 
 def preprocess_data(data, diameter, height, apply_offset=False, strain_increment=0.005):
     """
     Preprocess raw compression-test data into resampled flow curves.
-
-    Parameters
-    ----------
-    data : pd.DataFrame
-        Raw dataframe containing at least 'Jaw' and 'Force'. Optional 'TC1'.
-    diameter : float
-        Specimen diameter in mm.
-    height : float
-        Specimen height in mm.
-    apply_offset : bool
-        If True, apply elastic-region removal / re-zero to the (x,y) flow curve only.
-    strain_increment : float
-        Strain step size Δε used to build the resampled x-axis: 0, Δε, 2Δε, ..., x_max.
-        Example: 0.005.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: x, y_none, y_mild, y_strong, and optionally temperature_x, temperature.
     """
     dx = float(strain_increment)
     if not np.isfinite(dx) or dx <= 0:
@@ -38,7 +32,6 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
         xs = np.arange(0.0, x_max + 0.5 * dx, dx)
         if xs.size < 2:
             raise ValueError("strain_increment too large for the available strain range.")
-        # Ensure last point is exactly x_max (nice for exports/plots)
         if xs[-1] > x_max + 1e-12:
             xs[-1] = x_max
         elif xs[-1] < x_max - 1e-12:
@@ -59,7 +52,7 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
     if diameter <= 0 or height <= 0:
         raise ValueError("diameter and height must be positive.")
 
-    # Sign & compliance correction
+    # -------------------- SIGN & COMPLIANCE CORRECTION --------------------
     data["Jaw"] = -data["Jaw"]
     data["Force"] = -data["Force"]
     data["Jaw_corr"] = data["Jaw"] - data["Force"] * 0.0029
@@ -69,10 +62,7 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
     valid = np.isfinite(jaw) & (jaw < 0.98 * height)
 
     if not np.any(valid):
-        raise ValueError(
-            "No valid Jaw_corr samples found. "
-            "Check sign flip/compliance or specimen height."
-        )
+        raise ValueError("No valid Jaw_corr samples found.")
 
     N_CONSEC = 5
     ok = valid.astype(int)
@@ -86,10 +76,22 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
 
     data.reset_index(drop=True, inplace=True)
 
-    # True strain & flow stress
+    # -------------------- NEW: SENSOR SETTLING TRIM --------------------
+    # Bypasses anomalous sensor jumps (like Jaw starting at 7.25 then settling to 0)
+    # Finds the true start of the test by locating the minimum Jaw displacement before peak force
+    force_vals = data["Force"].values
+    jaw_vals = data["Jaw_corr"].values
+    peak_force_idx = int(np.argmax(force_vals))
+
+    if peak_force_idx > 0:
+        true_start_idx = int(np.argmin(jaw_vals[:peak_force_idx + 1]))
+        if true_start_idx > 0:
+            data = data.iloc[true_start_idx:].reset_index(drop=True)
+
+    # -------------------- TRUE STRAIN & STRESS --------------------
     denom = (height - data["Jaw_corr"])
-    if (denom <= 0).any():
-        raise ValueError("Invalid compression state: (height - Jaw_corr) <= 0 encountered.")
+    # Prevent divide-by-zero or negative logs if correction overshoots
+    denom = np.clip(denom, 0.001, None) 
 
     data["x"] = -np.log(denom / height)
     data["y"] = (
@@ -100,42 +102,13 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
     if "TC1" in data.columns:
         data["temperature"] = pd.to_numeric(data["TC1"], errors="coerce")
 
-    # Raw failure cutoff
     x_raw = data["x"].values.astype(float)
     y_raw = data["y"].values.astype(float)
     temp_raw = data["temperature"].values.astype(float) if "temperature" in data else None
 
-    # enforce strictly increasing strain for safe interpolation
-    order = np.argsort(x_raw)
-    x_raw = x_raw[order]
-    y_raw = y_raw[order]
-    if temp_raw is not None:
-        temp_raw = temp_raw[order]
-
-    # remove duplicate strain values
-    keep = np.ones_like(x_raw, dtype=bool)
-    keep[1:] = x_raw[1:] > x_raw[:-1]
-    x_raw = x_raw[keep]
-    y_raw = y_raw[keep]
-    if temp_raw is not None:
-        temp_raw = temp_raw[keep]
-
-    if x_raw.size < 5:
-        raise ValueError("Not enough valid samples after trimming.")
-
+    # -------------------- 1. CHRONOLOGICAL END CUT --------------------
     jaw_corr_raw = data["Jaw_corr"].values.astype(float)
-
-    cut = detect_end_index(
-        x_raw,
-        y_raw,
-        jaw_corr=jaw_corr_raw,
-        height=height,
-        min_after_peak=20,
-        near_zero_frac=0.05,
-        vol_window=15,
-        vol_factor=6.0,
-        n_consec=8,
-    )
+    cut = detect_end_index(x_raw, y_raw, jaw_corr=jaw_corr_raw, height=height)
 
     if cut is not None and cut > 10:
         x_raw = x_raw[:cut]
@@ -143,8 +116,20 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
         if temp_raw is not None:
             temp_raw = temp_raw[:cut]
 
+    # -------------------- 2. MONOTONIC STRAIN FILTER --------------------
+    # Drops backwards noise points safely instead of scrambling the timeline
+    running_max = np.maximum.accumulate(x_raw)
+    keep = x_raw >= running_max
+    
+    x_raw = x_raw[keep]
+    y_raw = y_raw[keep]
+    if temp_raw is not None:
+        temp_raw = temp_raw[keep]
 
-    # ---------- Offset applies ONLY to stress curve ----------
+    if x_raw.size < 5:
+        raise ValueError("Not enough valid samples after trimming.")
+        
+    # -------------------- 3. APPLY OPTIONAL OFFSET --------------------
     x_stress = x_raw
     y_stress = y_raw
 
@@ -159,28 +144,34 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
 
     max_x_stress = float(np.max(x_stress))
     if not np.isfinite(max_x_stress) or max_x_stress <= 0:
-        raise ValueError("Invalid strain range after preprocessing (max strain <= 0).")
+        raise ValueError("Invalid strain range after preprocessing.")
 
-    # ---------- Stress interpolation + filters ----------
+    # -------------------- 4. SAFE INTERPOLATION --------------------
     new_x = _grid_by_dx(max_x_stress, dx)
+    
+    # fill_value boundaries prevent the line from extrapolating into negative values
     fY = interp.interp1d(
         x_stress,
         y_stress,
         bounds_error=False,
-        fill_value="extrapolate",
+        fill_value=(y_stress[0], y_stress[-1]),
     )
     y_none = fY(new_x)
 
+    # -------------------- 5. FINAL CLIP & EXPORT --------------------
+    # np.clip mathematically guarantees no negative stress values (rings) from the filter
+    y_none_safe = np.clip(y_none, 0, None)
+    
     result = pd.DataFrame(
         {
             "x": new_x,
-            "y_none": y_none,
-            "y_mild": apply_filter(y_none, "mild"),
-            "y_strong": apply_filter(y_none, "strong"),
+            "y_none": y_none_safe,
+            "y_mild": np.clip(safe_savgol(y_none_safe, default_window=51), 0, None),
+            "y_strong": np.clip(safe_savgol(y_none_safe, default_window=101), 0, None),
         }
     )
 
-# Temperature interpolation onto same strain grid
+    # Temperature interpolation
     if temp_raw is not None:
         fT = interp.interp1d(
             x_raw,
@@ -189,6 +180,5 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
             fill_value=(float(temp_raw[0]), float(temp_raw[-1])),
         )
         result["temperature"] = fT(new_x)
-
 
     return result

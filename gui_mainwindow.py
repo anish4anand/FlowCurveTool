@@ -1,7 +1,10 @@
 import os
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+from openpyxl.chart import ScatterChart, Reference, Series
 
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
@@ -12,7 +15,6 @@ from PySide6.QtWidgets import (
 from dialogs import GeometryDialog, PreprocessOptionsDialog
 from preprocess import preprocess_data
 from utils import deform_qform_table, force_displacement_curve_from_raw
-
 
 class DataOptimizer(QMainWindow):
     def __init__(self):
@@ -55,14 +57,19 @@ class DataOptimizer(QMainWindow):
         self.remove_button.setEnabled(False)
         sidebar.addWidget(self.remove_button)
 
+        self.clear_all_btn = QPushButton("Clear All Datasets")
+        self.clear_all_btn.clicked.connect(self.clear_all_datasets)
+        self.clear_all_btn.setEnabled(False)
+        sidebar.addWidget(self.clear_all_btn)
+
         self.preprocess_btn = QPushButton("Process Raw Data (Selected)")
         self.preprocess_btn.clicked.connect(self.run_preprocess)
         self.preprocess_btn.setEnabled(False)
         sidebar.addWidget(self.preprocess_btn)
+        
         self.chk_process_all = QCheckBox("Process all loaded datasets")
         self.chk_process_all.setChecked(False)
         sidebar.addWidget(self.chk_process_all)
-
 
         # Plot filter checkboxes
         sidebar.addWidget(QLabel("Curves to show in plot:"))
@@ -91,15 +98,16 @@ class DataOptimizer(QMainWindow):
         self.export_btn.clicked.connect(self.export_results)
         self.export_btn.setEnabled(False)
         sidebar.addWidget(self.export_btn)
+        
         self.deform_export_btn = QPushButton("DEFORM / QForm Export")
         self.deform_export_btn.clicked.connect(self.export_deform_qform)
         self.deform_export_btn.setEnabled(False)
         sidebar.addWidget(self.deform_export_btn)
+        
         self.force_disp_export_btn = QPushButton("Export Force–Displacement (Selected)")
         self.force_disp_export_btn.clicked.connect(self.export_force_displacement_selected)
         self.force_disp_export_btn.setEnabled(False)
         sidebar.addWidget(self.force_disp_export_btn)
-
 
         sidebar.addStretch()
         main_layout.addLayout(sidebar, 1)
@@ -128,7 +136,6 @@ class DataOptimizer(QMainWindow):
         else:
             self.dataset_list.addItem(entry)
 
-
     def show_preview(self):
         if self.current_index is None or self.current_index < 0 or self.current_index >= len(self.datasets):
             self.preview_table.clear()
@@ -138,7 +145,6 @@ class DataOptimizer(QMainWindow):
 
         ds = self.datasets[self.current_index]
 
-        # Show processed if available, else raw
         if ds.get("preprocessed", False) and ds.get("proc_data") is not None:
             df = ds["proc_data"]
         else:
@@ -159,9 +165,12 @@ class DataOptimizer(QMainWindow):
         has_selection = self.current_index is not None and 0 <= self.current_index < len(self.datasets)
         any_processed = any(d.get("preprocessed", False) and d.get("proc_data") is not None for d in self.datasets)
 
+        self.clear_all_btn.setEnabled(len(self.datasets) > 0)
         self.preprocess_btn.setEnabled(has_selection)
+        
         self.plot_btn.setEnabled(any_processed)
         self.export_btn.setEnabled(any_processed)
+        
         has_proc_sel = (
             has_selection   
             and self.datasets[self.current_index].get("preprocessed", False)
@@ -170,14 +179,13 @@ class DataOptimizer(QMainWindow):
         self.deform_export_btn.setEnabled(has_proc_sel)
         self.force_disp_export_btn.setEnabled(has_proc_sel)
 
-
-# -------------------- Button Enable/Disable --------------------
+    # -------------------- Button Enable/Disable --------------------
     def update_buttons(self, index):
         has_selection = index >= 0 and index < len(self.datasets)
         self.edit_params_button.setEnabled(has_selection)
         self.remove_button.setEnabled(has_selection)
 
-# -------------------- Load CSV --------------------
+    # -------------------- Load CSV --------------------
     def load_dataset(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -188,7 +196,6 @@ class DataOptimizer(QMainWindow):
         if not paths:
             return
 
-        # Ask geometry ONCE
         dlg = GeometryDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -225,7 +232,7 @@ class DataOptimizer(QMainWindow):
                 failed.append(f"{os.path.basename(path)}: {e}")
 
         if loaded > 0:
-            self.preprocess_btn.setEnabled(True)
+            self.refresh_ui_state()
             QMessageBox.information(self, "Success", f"Loaded {loaded} file(s).")
 
         if failed:
@@ -235,9 +242,7 @@ class DataOptimizer(QMainWindow):
                 "The following files could not be loaded:\n\n" + "\n".join(failed)
             )
 
-
-     # -------------------- Switch Dataset --------------------
-
+    # -------------------- Switch Dataset --------------------
     def change_dataset(self, idx: int):
         self.current_index = idx
         self.refresh_ui_state()
@@ -247,6 +252,26 @@ class DataOptimizer(QMainWindow):
     def edit_parameters(self):
         if self.current_index is None:
             return
+
+        # NEW: Check if there are multiple datasets and ask for Probendaten
+        if len(self.datasets) > 1:
+            msgBox = QMessageBox(self)
+            msgBox.setWindowTitle("Edit Specimen Parameters")
+            msgBox.setText("You have multiple datasets loaded.\nHow would you like to edit the geometry?")
+            
+            btn_manual = msgBox.addButton("Edit Selected Manually", QMessageBox.ActionRole)
+            btn_auto = msgBox.addButton("Auto-Match All (Probendaten Excel)", QMessageBox.ActionRole)
+            btn_cancel = msgBox.addButton("Cancel", QMessageBox.RejectRole)
+            
+            msgBox.exec()
+            
+            if msgBox.clickedButton() == btn_cancel:
+                return
+            elif msgBox.clickedButton() == btn_auto:
+                self._import_probendaten()
+                return
+
+        # Standard manual edit
         ds = self.datasets[self.current_index]
         dialog = GeometryDialog(self, ds["diameter"], ds["height"])
         if dialog.exec() == QDialog.Accepted:
@@ -261,17 +286,107 @@ class DataOptimizer(QMainWindow):
             if ds["preprocessed"]:
                 QMessageBox.warning(self, "Warning", "Raw data already processed. Reprocess if needed.")
 
+    def _import_probendaten(self):
+        """Internal worker function to load and match the Probendaten Excel file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open Probendaten File", "", "Excel Files (*.xlsx *.xls);;CSV Files (*.csv)"
+        )
+        if not file_path:
+            return
+
+        try:
+            if file_path.lower().endswith('.csv'):
+                df_probe = pd.read_csv(file_path)
+            else:
+                df_probe = pd.read_excel(file_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not read file:\n{str(e)}")
+            return
+
+        v_col = None
+        d_col = None
+        h_col = None
+
+        for c in df_probe.columns:
+            c_str = str(c).strip().lower()
+            
+            # Match "Versuch" or "Versuchsnummer"
+            if 'versuch' in c_str:
+                v_col = c
+            
+            # Match Diameter: contains 'ø', 'durchmesser', or 'd0'
+            elif 'ø' in c_str or 'durchmesser' in c_str or 'd0' in c_str:
+                d_col = c
+                
+            # Match Height: contains 'h0', 'höh', or 'hoeh'
+            elif 'h0' in c_str or 'höh' in c_str or 'hoeh' in c_str:
+                h_col = c
+
+        if not v_col or not d_col or not h_col:
+            QMessageBox.warning(
+                self, "Error", 
+                f"Could not find the required columns in the file.\n\n"
+                f"Found columns: {', '.join(str(c) for c in df_probe.columns)}\n"
+                f"Looking for: 'Versuch', 'Ø' / 'd0' (Diameter), and 'h0' (Height)"
+            )
+            return
+
+        matched_count = 0
+        already_processed = False
+
+        for i, ds in enumerate(self.datasets):
+            fname = ds["filename"]
+            base_fname = fname.lower().replace('.csv', '')
+            
+            # Extract prefix number from filename e.g. "015-T100.csv" -> 15
+            prefix_match = re.match(r'^0*(\d+)', fname)
+            prefix_int = int(prefix_match.group(1)) if prefix_match else None
+
+            for idx, row in df_probe.iterrows():
+                v_val = row[v_col]
+                if pd.isna(v_val): continue
+                v_str = str(v_val).strip()
+
+                is_match = False
+                # Method 1: Strict Integer prefix match (Safest)
+                if prefix_int is not None:
+                    try:
+                        if int(float(v_str)) == prefix_int:
+                            is_match = True
+                    except ValueError:
+                        pass
+                
+                # Method 2: String prefix match (Fallback)
+                if not is_match:
+                    if base_fname == v_str.lower() or base_fname.startswith(v_str.lower() + "-") or base_fname.startswith(v_str.lower() + "_"):
+                        is_match = True
+
+                if is_match:
+                    d_val = row[d_col]
+                    h_val = row[h_col]
+                    if pd.notna(d_val) and pd.notna(h_val):
+                        ds["diameter"] = float(d_val)
+                        ds["height"] = float(h_val)
+                        self.update_list_entry(i)
+                        matched_count += 1
+                        if ds.get("preprocessed"):
+                            already_processed = True
+                    break
+
+        msg = f"Successfully matched and updated {matched_count} out of {len(self.datasets)} datasets."
+        if already_processed:
+            msg += "\n\nNote: Some updated datasets were already processed. You will need to re-process them for the new geometry to take effect."
+        
+        QMessageBox.information(self, "Probendaten Import", msg)
+
     def remove_dataset(self):
         row = self.dataset_list.currentRow()
         if row < 0 or row >= self.dataset_list.count():
             return
 
-        # Guard against model-view drift
         if row >= len(self.datasets):
-            # Hard resync: safest behavior
             self.datasets = self.datasets[: self.dataset_list.count()]
             if row >= len(self.datasets):
-                # nothing valid to delete from model; just clear the view row
                 item = self.dataset_list.takeItem(row)
                 del item
                 self.current_index = None
@@ -287,14 +402,10 @@ class DataOptimizer(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        # Remove from model
         del self.datasets[row]
-
-        # Remove from view (and actually delete the item)
         item = self.dataset_list.takeItem(row)
         del item
 
-        # If nothing left, hard-clear list + selection
         if len(self.datasets) == 0 or self.dataset_list.count() == 0:
             self.dataset_list.blockSignals(True)
             self.dataset_list.clear()
@@ -306,12 +417,33 @@ class DataOptimizer(QMainWindow):
             self.refresh_ui_state()
             return
 
-        # Otherwise, select next valid row
         new_row = min(row, self.dataset_list.count() - 1)
-        self.dataset_list.setCurrentRow(new_row)  # triggers change_dataset -> preview
+        self.dataset_list.setCurrentRow(new_row)  
         self.refresh_ui_state()
 
- # -------------------- Processing --------------------
+    def clear_all_datasets(self):
+        if not self.datasets:
+            return
+
+        reply = QMessageBox.question(
+            self, "Clear All Datasets",
+            "Are you sure you want to remove ALL loaded datasets? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.datasets.clear()
+            self.current_index = None
+            
+            self.dataset_list.blockSignals(True)
+            self.dataset_list.clear()
+            self.dataset_list.blockSignals(False)
+            
+            self.show_preview()
+            self.refresh_ui_state()
+            self.update_buttons(-1)
+
+    # -------------------- Processing --------------------
     def run_preprocess(self):
         if self.current_index is None or self.current_index < 0 or self.current_index >= len(self.datasets):
             QMessageBox.warning(self, "Error", "Select a dataset first.")
@@ -319,7 +451,6 @@ class DataOptimizer(QMainWindow):
 
         ds0 = self.datasets[self.current_index]
 
-        # Dialog: offset + resample points
         dlg = PreprocessOptionsDialog(
             self,
             default_apply_offset=ds0.get("apply_offset", False),
@@ -329,9 +460,9 @@ class DataOptimizer(QMainWindow):
             return
 
         apply_offset = dlg.get_apply_offset()
+        auto_average = dlg.get_auto_average() 
         dx = float(dlg.get_strain_increment())
 
-        # Decide which datasets to process
         if self.chk_process_all.isChecked():
             targets = self.datasets
         else:
@@ -354,7 +485,6 @@ class DataOptimizer(QMainWindow):
                 ds["preprocessed"] = True
                 processed_count += 1
 
-                # Keep list text in sync (shows offset state)
                 self.update_list_entry(self.datasets.index(ds))
 
             except Exception as e:
@@ -362,24 +492,93 @@ class DataOptimizer(QMainWindow):
                 return
 
         self.refresh_ui_state()
+        
+        msg = f"Processed {processed_count} dataset(s)."
+
+        if auto_average and processed_count > 0:
+            avg_count = self._run_averaging()
+            if avg_count > 0:
+                msg += f"\n\nAutomatically generated {avg_count} averaged dataset(s) at the bottom of the list."
 
         if processed_count > 0:
-            self.plot_btn.setEnabled(True)
-            self.export_btn.setEnabled(True)
+            QMessageBox.information(self, "Success", msg)
 
-        QMessageBox.information(self, "Success", f"Processed {processed_count} dataset(s).")
+    def _run_averaging(self):
+        processed = [d for d in self.datasets if d.get("preprocessed", False) and d.get("proc_data") is not None]
+        if not processed:
+            return 0
 
+        groups = {}
+        for ds in processed:
+            if str(ds["filename"]).startswith("AVG_"):
+                continue
 
-    def show_plots(self):
+            raw_name = ds["filename"].replace(".csv", "")
+            parts = raw_name.split("-")
+            
+            if len(parts) > 1:
+                condition = "-".join(parts[1:])
+            else:
+                condition = raw_name 
+                
+            if condition not in groups:
+                groups[condition] = []
+            groups[condition].append(ds)
+
+        new_datasets = []
+        averaged_count = 0
+
+        for condition, group in groups.items():
+            if len(group) < 2:
+                continue
+
+            min_len = min(len(ds["proc_data"]["x"]) for ds in group)
+
+            avg_df = pd.DataFrame()
+            avg_df["x"] = group[0]["proc_data"]["x"].values[:min_len]
+
+            cols_to_avg = ["y_none", "y_mild", "y_strong", "temperature"]
+            for col in cols_to_avg:
+                if col in group[0]["proc_data"].columns:
+                    stacked = np.vstack([ds["proc_data"][col].values[:min_len] for ds in group])
+                    avg_df[col] = np.mean(stacked, axis=0)
+
+            avg_ds = {
+                "filename": f"AVG_{condition}.csv",
+                "raw_data": avg_df, 
+                "proc_data": avg_df,
+                "preprocessed": True,
+                "diameter": group[0]["diameter"],
+                "height": group[0]["height"],
+                "apply_offset": group[0].get("apply_offset", False),
+                "strain_increment": group[0].get("strain_increment", 0.005),
+            }
+            new_datasets.append(avg_ds)
+            averaged_count += 1
+
+        for nds in new_datasets:
+            existing_names = [d["filename"] for d in self.datasets]
+            if nds["filename"] in existing_names:
+                idx = existing_names.index(nds["filename"])
+                self.datasets[idx] = nds
+                self.update_list_entry(idx)
+            else:
+                self.datasets.append(nds)
+                self.update_list_entry(len(self.datasets) - 1)
+
+        self.refresh_ui_state()
+        return averaged_count
+
+    # -------------------- PLOTTING --------------------
+    def _build_figure(self):
         processed = [
             d for d in self.datasets
             if d.get("preprocessed", False) and d.get("proc_data") is not None
         ]
         if not processed:
             QMessageBox.warning(self, "Error", "No processed datasets to plot.")
-            return
+            return None
 
-        # Which filter curves to plot (based on checkboxes)
         selected = []
         if self.chk_none.isChecked():
             selected.append("none")
@@ -390,29 +589,7 @@ class DataOptimizer(QMainWindow):
 
         if not selected:
             QMessageBox.warning(self, "Error", "Select at least one curve to plot.")
-            return
-
-        # Style map: different colours for different filters (same across datasets)
-        FILTER_STYLES = {
-            "none":   {"color": "black",    "linestyle": "-",  "label": "Unfiltered"},
-            "mild":   {"color": "tab:blue", "linestyle": "--", "label": "Mild"},
-            "strong": {"color": "tab:red",  "linestyle": "-.", "label": "Strong"},
-        }
-
-        fig, axes = plt.subplots(2, 1, figsize=(9, 10), sharex=False)
-
-       # ---------- FLOW STRESS ----------
-        selected = []
-        if self.chk_none.isChecked():
-            selected.append("none")
-        if self.chk_mild.isChecked():
-            selected.append("mild")
-        if self.chk_strong.isChecked():
-            selected.append("strong")
-
-        if not selected:
-            QMessageBox.warning(self, "Error", "Select at least one curve to plot.")
-            return
+            return None
 
         FILTER_LINESTYLES = {
             "none": "-",
@@ -420,13 +597,30 @@ class DataOptimizer(QMainWindow):
             "strong": "-.",
         }
 
+        num_items = len(processed)
+        if num_items <= 15:
+            leg_cols = 1
+            plot_width = 0.75
+            font_sz = 8
+            fig_width = 9
+        elif num_items <= 30:
+            leg_cols = 2
+            plot_width = 0.60
+            font_sz = 7
+            fig_width = 12
+        else:
+            leg_cols = 3
+            plot_width = 0.45
+            font_sz = 6
+            fig_width = 15
+
+        fig, axes = plt.subplots(2, 1, figsize=(fig_width, 10), sharex=False)
         plotted_any = False
 
         for ds in processed:
             df = ds["proc_data"]
             fname = ds["filename"]
 
-            # pick first available filter to set dataset color
             first_filt = next(
                 (f for f in selected if f"y_{f}" in df.columns),
                 None
@@ -434,7 +628,6 @@ class DataOptimizer(QMainWindow):
             if first_filt is None:
                 continue
 
-            # plot first curve → one legend entry per dataset
             line, = axes[0].plot(
                 df["x"].values,
                 df[f"y_{first_filt}"].values,
@@ -445,7 +638,6 @@ class DataOptimizer(QMainWindow):
             dataset_color = line.get_color()
             plotted_any = True
 
-            # remaining filters: same color, no legend
             for filt in selected:
                 if filt == first_filt:
                     continue
@@ -471,12 +663,11 @@ class DataOptimizer(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Plotting error",
-                "No flow-stress curves were plotted.\n"
-                "Check processed data columns."
+                "No flow-stress curves were plotted.\nCheck processed data columns."
             )
-            return
+            plt.close(fig)
+            return None
 
-                # ---------- TEMPERATURE (reference) ----------
         has_temp = any("temperature" in d["proc_data"].columns for d in processed)
         if has_temp:
             for ds in processed:
@@ -500,7 +691,6 @@ class DataOptimizer(QMainWindow):
         else:
             axes[1].set_visible(False)
 
-# ---------- LEGENDS OUTSIDE ----------
         for ax in axes:
             if ax.get_visible():
                 h, l = ax.get_legend_handles_labels()
@@ -510,20 +700,20 @@ class DataOptimizer(QMainWindow):
                         loc="upper left",
                         bbox_to_anchor=(1.02, 1.0),
                         borderaxespad=0.0,
-                        fontsize=8
+                        fontsize=font_sz,
+                        ncol=leg_cols
                     )
 
-        plt.tight_layout(rect=[0, 0, 0.75, 1])
-        plt.show()
+        plt.tight_layout(rect=[0, 0, plot_width, 1], h_pad=3.0)
+        return fig
 
+    def show_plots(self):
+        fig = self._build_figure()
+        if fig:
+            plt.show()
 
-
+    # -------------------- EXPORT LOGIC --------------------
     def _safe_sheet_name(self, name: str, suffix: str) -> str:
-        """
-        Excel sheet name constraints:
-        - max 31 chars
-        - cannot contain: : \ / ? * [ ]
-        """
         bad = [":", "\\", "/", "?", "*", "[", "]"]
         out = name
         for b in bad:
@@ -531,10 +721,7 @@ class DataOptimizer(QMainWindow):
         out = f"{out}__{suffix}"
         return out[:31]
     
-    # --- Export Results to Excel ---
-
     def export_results(self):
-        # 1) Ask scope AFTER clicking Export
         if not self.datasets:
             QMessageBox.warning(self, "Error", "No datasets loaded.")
             return
@@ -546,14 +733,13 @@ class DataOptimizer(QMainWindow):
             "Yes  = Export ALL processed datasets (one sheet per dataset)\n"
             "No   = Export SELECTED dataset only",
             QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-            QMessageBox.No,  # default
+            QMessageBox.No,  
         )
         if choice == QMessageBox.Cancel:
             return
 
         export_all = (choice == QMessageBox.Yes)
 
-        # 2) Determine targets
         if export_all:
             targets = [d for d in self.datasets if d.get("preprocessed", False) and d.get("proc_data") is not None]
             if not targets:
@@ -569,7 +755,6 @@ class DataOptimizer(QMainWindow):
                 return
             targets = [ds]
 
-        # 3) Choose curve to export
         export_filter = self.export_filter_combo.currentText().strip().lower()
         col_map = {"none": "y_none", "mild": "y_mild", "strong": "y_strong"}
         y_col = col_map.get(export_filter)
@@ -577,7 +762,6 @@ class DataOptimizer(QMainWindow):
             QMessageBox.warning(self, "Error", f"Unknown export filter: {export_filter}")
             return
 
-        # 4) Choose file path
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Results",
@@ -589,7 +773,6 @@ class DataOptimizer(QMainWindow):
         if not file_path.lower().endswith(".xlsx"):
             file_path += ".xlsx"
 
-        # 5) Write Excel (one sheet per dataset)
         try:
             with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
                 for ds in targets:
@@ -610,6 +793,33 @@ class DataOptimizer(QMainWindow):
                     sheet = self._safe_sheet_name(ds["filename"], f"filter_{export_filter}")
                     out.to_excel(writer, sheet_name=sheet, index=False)
 
+                    # --- ALWAYS GENERATE EXCEL CHART ---
+                    ws = writer.sheets[sheet]
+                    chart = ScatterChart()
+                    chart.title = f"Flow Curve: {ds['filename']}"
+                    chart.style = 2  
+                    
+                    chart.x_axis.delete = False
+                    chart.y_axis.delete = False
+                    
+                    chart.x_axis.tickLblPos = "low"
+                    chart.y_axis.tickLblPos = "low"
+                    
+                    chart.x_axis.title = "Strain [-]"
+                    chart.y_axis.title = "Flow Stress [MPa]"
+                    chart.width = 16  
+                    chart.height = 10 
+                    chart.legend = None 
+
+                    max_row = len(out) + 1
+                    xvalues = Reference(ws, min_col=1, min_row=2, max_row=max_row)
+                    values = Reference(ws, min_col=2, min_row=2, max_row=max_row)
+
+                    series = Series(values, xvalues, title="Flow Stress")
+                    chart.series.append(series)
+
+                    ws.add_chart(chart, "E2")
+
             QMessageBox.information(
                 self,
                 "Success",
@@ -622,8 +832,6 @@ class DataOptimizer(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Export failed:\n{str(e)}")
 
-
-# -------------------- Deform/QFORM Export --------------------
     def export_deform_qform(self):
         idx = self.current_index
         if idx is None or idx < 0 or idx >= len(self.datasets):
@@ -637,19 +845,16 @@ class DataOptimizer(QMainWindow):
 
         df = ds["proc_data"]
 
-        # strong-by-default with fallback
-        y_col = "y_strong" if "y_strong" in df.columns else ("y_mild" if "y_mild" in df.columns else "y_none")
-
         try:
-            out = deform_qform_table(
-                df,
-                y_col=y_col,
-                n_early=15,
-                n_late=10,
-                split_frac=0.20,
-                enforce_monotonic=True,
-                clip_nonnegative=True,
-            )
+            filter_text = self.export_filter_combo.currentText().lower()
+            if "mild" in filter_text:
+                chosen_y_col = "y_mild"
+            elif "strong" in filter_text:
+                chosen_y_col = "y_strong"
+            else:
+                chosen_y_col = "y_none"
+
+            out = deform_qform_table(df, y_col=chosen_y_col, n_points=25, cluster_factor=50.0)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to build DEFORM/QForm table:\n{str(e)}")
             return
@@ -664,6 +869,33 @@ class DataOptimizer(QMainWindow):
             with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
                 sheet = self._safe_sheet_name(ds["filename"], "deform_qform")
                 out.to_excel(writer, sheet_name=sheet, index=False)
+
+                # --- ALWAYS GENERATE DEFORM EXCEL CHART ---
+                ws = writer.sheets[sheet]
+                chart = ScatterChart()
+                chart.title = f"DEFORM/QForm Curve: {ds['filename']}"
+                chart.style = 2  
+                
+                chart.x_axis.delete = False
+                chart.y_axis.delete = False
+                
+                chart.x_axis.tickLblPos = "low"
+                chart.y_axis.tickLblPos = "low"
+                
+                chart.x_axis.title = "Strain [-]"
+                chart.y_axis.title = "Flow Stress [MPa]"
+                chart.width = 16  
+                chart.height = 10 
+                chart.legend = None 
+
+                max_row = len(out) + 1
+                xvalues = Reference(ws, min_col=1, min_row=2, max_row=max_row)
+                values = Reference(ws, min_col=2, min_row=2, max_row=max_row)
+
+                series = Series(values, xvalues, title="Flow Stress")
+                chart.series.append(series)
+
+                ws.add_chart(chart, "D2") 
 
             QMessageBox.information(self, "Success", f"Exported {len(out)} points to:\n{file_path}")
         except Exception as e:
