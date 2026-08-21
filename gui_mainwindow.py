@@ -6,10 +6,12 @@ import matplotlib.pyplot as plt
 
 from openpyxl.chart import ScatterChart, Reference, Series
 
+from PySide6.QtCore import QTimer 
+
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QPushButton,
     QFileDialog, QMessageBox, QLabel, QListWidget, QTableWidget,
-    QTableWidgetItem, QCheckBox, QComboBox, QDialog
+    QTableWidgetItem, QCheckBox, QComboBox, QDialog, QInputDialog
 )
 
 from dialogs import GeometryDialog, PreprocessOptionsDialog
@@ -99,15 +101,25 @@ class DataOptimizer(QMainWindow):
         self.export_btn.setEnabled(False)
         sidebar.addWidget(self.export_btn)
         
+        self.force_disp_export_btn = QPushButton("Export Force–Displacement (Selected)")
+        self.force_disp_export_btn.clicked.connect(self.export_force_displacement_selected)
+        self.force_disp_export_btn.setEnabled(False)
+        sidebar.addWidget(self.force_disp_export_btn)
+
         self.deform_export_btn = QPushButton("DEFORM / QForm Export")
         self.deform_export_btn.clicked.connect(self.export_deform_qform)
         self.deform_export_btn.setEnabled(False)
         sidebar.addWidget(self.deform_export_btn)
         
-        self.force_disp_export_btn = QPushButton("Export Force–Displacement (Selected)")
-        self.force_disp_export_btn.clicked.connect(self.export_force_displacement_selected)
-        self.force_disp_export_btn.setEnabled(False)
-        sidebar.addWidget(self.force_disp_export_btn)
+        self.extrapolate_btn = QPushButton("Extrapolate Models (Selected)")
+        self.extrapolate_btn.clicked.connect(self.run_extrapolation)
+        self.extrapolate_btn.setEnabled(False)
+        sidebar.addWidget(self.extrapolate_btn)
+
+        self.deform_key_export_btn = QPushButton("DEFORM 3D Keyword Export (.key)")
+        self.deform_key_export_btn.clicked.connect(self.export_deform_key)
+        self.deform_key_export_btn.setEnabled(False)
+        sidebar.addWidget(self.deform_key_export_btn)
 
         sidebar.addStretch()
         main_layout.addLayout(sidebar, 1)
@@ -120,15 +132,13 @@ class DataOptimizer(QMainWindow):
 
     def update_list_entry(self, idx: int):
         ds = self.datasets[idx]
-        off = ds.get("apply_offset", None)
-        off_txt = "Offset=?" if off is None else f"Offset={'Yes' if off else 'No'}"
 
         dx = ds.get("strain_increment", None)
         dx_txt = "Δε=?" if dx is None else f"Δε={dx:g}"
 
         entry = (
             f"{ds['filename']}  |  D={ds['diameter']} mm, H={ds['height']} mm  |  "
-            f"{off_txt}  |  {dx_txt}"
+            f"{dx_txt}"
         )
 
         if idx < self.dataset_list.count():
@@ -177,7 +187,16 @@ class DataOptimizer(QMainWindow):
             and self.datasets[self.current_index].get("proc_data") is not None
             )
         self.deform_export_btn.setEnabled(has_proc_sel)
+        self.deform_key_export_btn.setEnabled(has_proc_sel)
         self.force_disp_export_btn.setEnabled(has_proc_sel)
+
+        has_proc_sel = (
+            has_selection   
+            and self.datasets[self.current_index].get("preprocessed", False)
+            and self.datasets[self.current_index].get("proc_data") is not None
+            )
+    
+        self.extrapolate_btn.setEnabled(has_proc_sel)
 
     # -------------------- Button Enable/Disable --------------------
     def update_buttons(self, index):
@@ -221,7 +240,6 @@ class DataOptimizer(QMainWindow):
                     "height": float(height),
                     "proc_data": None,
                     "preprocessed": False,
-                    "apply_offset": False,
                 }
 
                 self.datasets.append(ds)
@@ -453,13 +471,11 @@ class DataOptimizer(QMainWindow):
 
         dlg = PreprocessOptionsDialog(
             self,
-            default_apply_offset=ds0.get("apply_offset", False),
             default_strain_increment=ds0.get("strain_increment", 0.005),
         )
         if dlg.exec() != QDialog.Accepted:
             return
 
-        apply_offset = dlg.get_apply_offset()
         auto_average = dlg.get_auto_average() 
         dx = float(dlg.get_strain_increment())
 
@@ -472,14 +488,12 @@ class DataOptimizer(QMainWindow):
 
         for ds in targets:
             try:
-                ds["apply_offset"] = apply_offset
                 ds["strain_increment"] = dx
 
                 ds["proc_data"] = preprocess_data(
                     ds["raw_data"],
                     ds["diameter"],
                     ds["height"],
-                    apply_offset=apply_offset,
                     strain_increment=dx,
                 )
                 ds["preprocessed"] = True
@@ -550,7 +564,6 @@ class DataOptimizer(QMainWindow):
                 "preprocessed": True,
                 "diameter": group[0]["diameter"],
                 "height": group[0]["height"],
-                "apply_offset": group[0].get("apply_offset", False),
                 "strain_increment": group[0].get("strain_increment", 0.005),
             }
             new_datasets.append(avg_ds)
@@ -709,9 +722,119 @@ class DataOptimizer(QMainWindow):
 
     def show_plots(self):
         fig = self._build_figure()
-        if fig:
-            plt.show()
+        if not fig:
+            return
 
+        # State tracking for the interactive cutter
+        self._is_cutting = False
+        self._hover_line = None
+        
+        # Check if ANY dataset has been processed (no longer restricted to one selected dataset)
+        processed_datasets = [d for d in self.datasets if d.get("preprocessed") and d.get("proc_data") is not None]
+        
+        if processed_datasets:
+            from matplotlib.widgets import Button
+            
+            # 1. Add the Matplotlib Button to the bottom right of the figure window
+            self._btn_ax = fig.add_axes([0.78, 0.03, 0.18, 0.06])
+            self._cut_btn = Button(self._btn_ax, 'Manual Offset\n(All Data)')
+            
+            main_ax = fig.axes[0]
+            
+            # 2. Button Click Event -> Activates Cutting Mode
+            def on_click_btn(event):
+                self._is_cutting = True
+                main_ax.set_title("Hover & Click to set new origin for ALL curves", color='red', fontweight='bold')
+                fig.canvas.draw_idle()
+                
+            self._cut_btn.on_clicked(on_click_btn)
+            
+            # 3. Mouse Hover Event -> Draws the vertical dashed line
+            def on_mouse_move(event):
+                if not self._is_cutting:
+                    return
+                # Ensure the mouse is actually inside the graph area
+                if event.inaxes != main_ax:
+                    if self._hover_line:
+                        self._hover_line.set_visible(False)
+                        fig.canvas.draw_idle()
+                    return
+                    
+                # Update or create the red dashed cursor line
+                if self._hover_line is None:
+                    self._hover_line = main_ax.axvline(x=event.xdata, color='red', linestyle='--', linewidth=1.5)
+                else:
+                    self._hover_line.set_xdata([event.xdata, event.xdata])
+                    self._hover_line.set_visible(True)
+                fig.canvas.draw_idle()
+                
+            # 4. Plot Click Event -> Executes the Cut
+            def on_plot_click(event):
+                if not self._is_cutting:
+                    return
+                if event.inaxes != main_ax:
+                    return
+                
+                # Capture the X strain coordinate clicked
+                x_val = event.xdata
+                
+                # Reset interaction state
+                self._is_cutting = False
+                
+                # Apply the mathematical cut to ALL datasets
+                self._apply_manual_cut_all(x_val)
+                
+                # Close the window and use a timer to instantly reopen it with the new data
+                import matplotlib.pyplot as plt
+                from PySide6.QtCore import QTimer
+                plt.close(fig)
+                QTimer.singleShot(100, self.show_plots)
+
+            # Bind the events to the figure canvas
+            fig.canvas.mpl_connect('motion_notify_event', on_mouse_move)
+            fig.canvas.mpl_connect('button_press_event', on_plot_click)
+
+        import matplotlib.pyplot as plt
+        plt.show()
+
+    def _apply_manual_cut_all(self, target_x):
+        """
+        Slices ALL preprocessed dataframes at the user-selected point and shifts 
+        the strain (X) back to 0. Stress (Y) remains strictly absolute.
+        """
+        import numpy as np
+        
+        for ds in self.datasets:
+            df = ds.get("proc_data")
+            
+            # Skip if dataset hasn't been processed yet
+            if df is None or "x" not in df.columns:
+                continue
+                
+            x_vals = df["x"].values
+            
+            # Find the index of the data point closest to where the user clicked for THIS specific curve
+            closest_idx = (np.abs(x_vals - target_x)).argmin()
+            
+            # Slice the dataset
+            df_cut = df.iloc[closest_idx:].copy()
+            
+            if df_cut.empty:
+                continue
+            
+            # Shift the strain axis so the new start point is strictly 0.0
+            x0 = df_cut["x"].iloc[0]
+            df_cut["x"] = df_cut["x"] - x0
+            
+            # If there's an independent temperature X-axis tracking, shift it too
+            if "temperature_x" in df_cut.columns:
+                df_cut["temperature_x"] = df_cut["temperature_x"] - x0
+                
+            # Overwrite the dataset state
+            ds["proc_data"] = df_cut.reset_index(drop=True)
+            
+        # Refresh the PySide preview table so the GUI stays in sync
+        self.show_preview()
     # -------------------- EXPORT LOGIC --------------------
     def _safe_sheet_name(self, name: str, suffix: str) -> str:
         bad = [":", "\\", "/", "?", "*", "[", "]"]
@@ -952,3 +1075,326 @@ class DataOptimizer(QMainWindow):
             )
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Export failed:\n{str(e)}")
+
+    def run_extrapolation(self):
+        idx = self.current_index
+        if idx is None or idx < 0 or idx >= len(self.datasets):
+            QMessageBox.warning(self, "Error", "Select a dataset first.")
+            return
+
+        ds = self.datasets[idx]
+        if not ds.get("preprocessed", False) or ds.get("proc_data") is None:
+            QMessageBox.warning(self, "Error", "Process the dataset first.")
+            return
+
+        # 1. Ask for Target Extrapolation Strain
+        max_strain, ok = QInputDialog.getDouble(
+            self, "Extrapolation Target", 
+            "Enter maximum strain for extrapolation:", 
+            2.0, 0.1, 100.0, 2
+        )
+        if not ok:
+            return
+
+        df = ds["proc_data"]
+        
+        # Determine which curve to fit
+        filter_text = self.export_filter_combo.currentText().strip().lower()
+        if "mild" in filter_text:
+            y_col = "y_mild"
+        elif "strong" in filter_text:
+            y_col = "y_strong"
+        else:
+            y_col = "y_none"
+
+        if y_col not in df.columns:
+            QMessageBox.warning(self, "Error", f"Column {y_col} not found in processed data.")
+            return
+
+        epsilon = df["x"].values.astype(float)
+        sigma = df[y_col].values.astype(float)
+        
+        # --- FIX: Only fit the uniform hardening region (up to peak stress) ---
+        peak_idx = np.argmax(sigma)
+        epsilon_fit = epsilon[:peak_idx + 1]
+        sigma_fit = sigma[:peak_idx + 1]
+
+        # 2. Fit Models
+        from utils import fit_extrapolation_models, evaluate_model
+        try:
+            params_dict = fit_extrapolation_models(epsilon_fit, sigma_fit)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Model fitting failed:\n{str(e)}")
+            return
+            
+        # 3. Generate Extrapolation DataFrame
+        interp_epsilon = np.linspace(max(0.01, np.min(epsilon)), max_strain, 200)
+        out_data = {'epsilon': interp_epsilon}
+        model_names = ['Hollomon', 'Ludwik', 'Swift', 'Voce', 'Hockett-Sherby', 'Swift+Voce']
+        
+        for model in model_names:
+            safe_name = model.lower().replace('-', '_').replace('+', '_')
+            out_data[safe_name] = evaluate_model(
+                model, interp_epsilon, params_dict[model], 
+                params_dict.get('Swift'), params_dict.get('Voce')
+            )
+            
+        interp_df = pd.DataFrame(out_data)
+            
+        # 4. Visualizer
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.scatter(epsilon, sigma, label="Measured Data", color="black", s=20, alpha=0.8)
+        
+        if params_dict['Hollomon'] is not None:
+            ax.plot(interp_epsilon, out_data['hollomon'], label="Hollomon", linestyle="--")
+            
+        if params_dict['Ludwik'] is not None:
+            ax.plot(interp_epsilon, out_data['ludwik'], label="Ludwik", linestyle="-.")
+            
+        if params_dict['Swift'] is not None:
+            ax.plot(interp_epsilon, out_data['swift'], label="Swift", linestyle=":")
+            
+        if params_dict['Voce'] is not None:
+            ax.plot(interp_epsilon, out_data['voce'], label="Voce", linestyle="-")
+            
+        if params_dict['Hockett-Sherby'] is not None:
+            ax.plot(interp_epsilon, out_data['hockett_sherby'], label="Hockett-Sherby", linestyle=(0, (3, 1, 1, 1)))
+            
+        if params_dict['Swift+Voce'] is not None:
+            ax.plot(interp_epsilon, out_data['swift_voce'], label="Swift+Voce", linewidth=2)
+            
+        ax.set_xlabel("Strain [-]")
+        ax.set_ylabel("Flow Stress [MPa]")
+        ax.set_title(f"Extrapolation Models: {ds['filename']}")
+        ax.grid(True, alpha=0.3)
+        
+        # Legend at the bottom in 2 columns
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.12), ncol=2, borderaxespad=0.0)
+        fig.subplots_adjust(bottom=0.25)
+        
+        plt.show()
+
+       # 5. Optional Export
+        reply = QMessageBox.question(
+            self, "Export Results", 
+            "Would you like to export the extrapolated curve data to Excel?", 
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+
+        if reply == QMessageBox.Yes:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Extrapolated Curves",
+                self._safe_sheet_name(ds['filename'], 'extrapolated'),
+                "Excel File (*.xlsx)"
+            )
+            
+            if file_path:
+                if not file_path.lower().endswith(".xlsx"):
+                    file_path += ".xlsx"
+                try:
+                    from openpyxl.chart import ScatterChart, Reference, Series
+                    
+                    sheet_name = self._safe_sheet_name(ds['filename'], 'extrapolate')
+                    
+                    # Use ExcelWriter to write the data and embed the chart
+                    with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
+                        interp_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                        
+                        ws = writer.sheets[sheet_name]
+                        chart = ScatterChart()
+                        chart.title = f"Extrapolation Models: {ds['filename']}"
+                        chart.style = 2  
+                        chart.x_axis.title = "Strain [-]"
+                        chart.y_axis.title = "Flow Stress [MPa]"
+                        chart.width = 18  
+                        chart.height = 12
+                        
+                        max_row = len(interp_df) + 1
+                        # X-values are always the first column (epsilon)
+                        xvalues = Reference(ws, min_col=1, min_row=2, max_row=max_row)
+                        
+                        # Loop through the remaining columns (the models) to add them to the chart
+                        for col_idx, col_name in enumerate(interp_df.columns[1:], start=2):
+                            # Only plot the model if it didn't fail (isn't full of NaNs)
+                            if not interp_df[col_name].isna().all():
+                                yvalues = Reference(ws, min_col=col_idx, min_row=2, max_row=max_row)
+                                # Clean up the column name for the legend (e.g., 'hockett_sherby' -> 'Hockett Sherby')
+                                nice_title = col_name.replace('_', ' ').title()
+                                series = Series(yvalues, xvalues, title=nice_title)
+                                chart.series.append(series)
+                        
+                        # Place the chart to the right of the data table (Column I)
+                        ws.add_chart(chart, "I2")
+
+                    QMessageBox.information(self, "Success", f"Extrapolated curves and graph exported to:\n{file_path}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to save Excel file:\n{str(e)}")
+
+    def export_deform_key(self):
+        import re
+        import numpy as np
+        from scipy.interpolate import interp1d
+        
+        # 1. Gather all processed datasets
+        processed_ds = [ds for ds in self.datasets if ds.get("preprocessed") and ds.get("proc_data") is not None]
+        
+        if not processed_ds:
+            QMessageBox.warning(self, "Error", "No processed datasets available to export.")
+            return
+
+        # Determine which curve filter to use
+        filter_text = self.export_filter_combo.currentText().strip().lower()
+        y_col = "y_mild" if "mild" in filter_text else "y_strong" if "strong" in filter_text else "y_none"
+
+        parsed_data = []
+        max_strain_global = 100.0
+        
+        # 2. Parse Filenames for Temperature (T) and Strain Rate (SR)
+        for ds in processed_ds:
+            filename = ds['filename']
+            match = re.search(r'T([\d\.]+).*?SR([\d\.]+)', filename, re.IGNORECASE)
+            
+            if not match:
+                QMessageBox.warning(self, "Naming Error", 
+                                    f"Could not extract Temperature and Strain Rate from:\n{filename}\n"
+                                    "Ensure format contains e.g., 'T200' and 'SR1'.")
+                return
+                
+            temp = float(match.group(1))
+            sr = float(match.group(2))
+            
+            df = ds['proc_data']
+            epsilon = df['x'].values
+            sigma = df[y_col].values
+            
+            max_strain_global = min(max_strain_global, epsilon[-1])
+            parsed_data.append({'T': temp, 'SR': sr, 'eps': epsilon, 'sig': sigma})
+
+        # 3. Establish the 3D Grid Requirements
+        unique_T = sorted(list(set(d['T'] for d in parsed_data)))
+        unique_SR = sorted(list(set(d['SR'] for d in parsed_data)))
+        
+        if len(parsed_data) != len(unique_T) * len(unique_SR):
+            QMessageBox.warning(self, "Grid Error", 
+                                f"DEFORM requires a full matrix. You provided {len(parsed_data)} curves, "
+                                f"but {len(unique_T)} Temps × {len(unique_SR)} Rates = {len(unique_T)*len(unique_SR)} curves are required.")
+            return
+
+        # Ask user for Material Name
+        material_name, ok = QInputDialog.getText(self, "Material Name", "Enter Material Name for DEFORM:", text="Exported_Alloy")
+        if not ok or not material_name: return
+
+        # Ask user how many strain points they want
+        num_strains, ok = QInputDialog.getInt(self, "Strain Points", "How many strain points for the matrix?", 20, 5, 100)
+        if not ok: return
+
+        common_strain = np.linspace(0.0, max_strain_global, num_strains)
+        
+        # 4. Generate the Matrix Data
+        matrix_stresses = []
+        for T in unique_T:
+            for SR in unique_SR:
+                curve = next(item for item in parsed_data if item['T'] == T and item['SR'] == SR)
+                f = interp1d(curve['eps'], curve['sig'], bounds_error=False, fill_value=(curve['sig'][0], curve['sig'][-1]))
+                interp_sig = np.maximum(f(common_strain), 0.01)
+                matrix_stresses.extend(interp_sig.tolist())
+
+        # Helper to format numbers like DEFORM expects (e.g., E+001 instead of E+01)
+        def format_deform_float(val):
+            s = f"{val:.10E}"
+            base, exponent = s.split('E')
+            return f"{base}E{exponent[0]}{int(exponent[1:]):03d}"
+
+        def chunk_list(lst, chunk_size=7):
+            lines = []
+            for i in range(0, len(lst), chunk_size):
+                chunk = lst[i:i+chunk_size]
+                lines.append("    " + "    ".join([format_deform_float(v) for v in chunk]))
+            return "\n".join(lines)
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save DEFORM Keyword File", f"{material_name}.key", "Keyword File (*.key);;Text File (*.txt)")
+        if not file_path: return
+
+        # 5. Format and Save the Keyword File
+        static_footer = """YOUNG        2       0    2.1000000000E+005
+POISON       2       0    3.0000000000E-001
+EXPAND       2       0    1.2000000000E-005    2.0000000000E+001
+THRCND       2       1      12
+    1.0000000000E+002    5.0708000000E+001
+    1.9900000000E+002    4.8112000000E+001
+    2.9900000000E+002    4.5689000000E+001
+    3.9900000000E+002    4.1718000000E+001
+    4.9900000000E+002    3.8279000000E+001
+    5.9900000000E+002    3.3943000000E+001
+    6.9900000000E+002    3.0130000000E+001
+    7.9900000000E+002    2.4747000000E+001
+    9.9900000000E+002    3.2896000000E+001
+    1.1990000000E+003    2.9756000000E+001
+    1.3500000000E+003    2.9000000000E+001
+    1.4850000000E+003    2.9000000000E+001
+HEATCP       2       1      14       0
+    1.0000000000E+002    3.8098100000E+000
+    1.9900000000E+002    4.0397200000E+000
+    2.4900000000E+002    4.1382000000E+000
+    2.9900000000E+002    3.1254000000E+000
+    3.4900000000E+002    4.4666800000E+000
+    3.9900000000E+002    4.5980500000E+000
+    4.9900000000E+002    5.0907000000E+000
+    5.9900000000E+002    5.5505100000E+000
+    6.9900000000E+002    6.0431500000E+000
+    7.4900000000E+002    1.2414700000E+001
+    7.9900000000E+002    4.8936400000E+000
+    8.9900000000E+002    4.3024600000E+000
+    1.3500000000E+003    4.3000000000E+000
+    1.4850000000E+003    4.3000000000E+000
+MASDEN       2       0    7.8700000000E-009
+VSCOSY       2       0    0.0000000000E+000
+COARSE       2       0
+DIFBND       2       0    0.0000000000E+000
+EMSVTY       2       0    7.0000000000E-001
+HDNPHA       2       0    0.0000000000E+000
+MSTMTR       2       0
+CREEP        2       0
+DIFCOE       2       0    0.0000000000E+000       0       1
+RA1COF       2       0    0.0000000000E+000    0.0000000000E+000       1
+RA2COF       2       0    0.0000000000E+000    0.0000000000E+000       1
+ELRST        2       0    0.0000000000E+000
+UTSDAT       2       0    0.0000000000E+000
+HDNRUL       2       0
+PMEAB        2       0    0.0000000000E+000
+PMITT        2       0    0.0000000000E+000
+MATDEN       2    0.0000000000E+000
+BURGRS       2       0    0.0000000000E+000
+ALPHA        2       0    0.0000000000E+000
+NDISFM       2       0    0.0000000000E+000
+RECVRY       2       0    0.0000000000E+000
+SIZEMD       2       0
+TXTURE       2       0       1       1
+GBENGY       2       0    0.0000000000E+000
+GBMOBI       2    0.0000000000E+000    0.0000000000E+000
+NUCSIZ       2       0    0.0000000000E+000
+HYPREL       2       0
+PMCONS       2       0       0
+"""
+
+        try:
+            with open(file_path, 'w') as f:
+                f.write("*\n*  DEFORM MATERIAL KEYWORD FILE\n*\n")
+                f.write("UNIT         1\n*\n*  Property Data of Material     2\n*\n")
+                f.write(f"MTNAME       2\n{material_name}\n")
+                f.write("FRAE2H       2    9.0000000000E-001       0\n")
+                f.write("FPERV        2    0.0000000000E+000       0    0.0000000000E+000       0\n")
+                f.write("FRCMOD       2       0    0.0000000000E+000    0.0000000000E+000    0.0000000000E+000    0.0000000000E+000    0.0000000000E+000       0       0\n")
+                f.write("FSTRES       2       2\n")
+                f.write(f"       {len(common_strain)}       {len(unique_SR)}       {len(unique_T)}\n")
+                f.write(chunk_list(common_strain) + "\n")
+                f.write(chunk_list(unique_SR) + "\n")
+                f.write(chunk_list(unique_T) + "\n")
+                f.write(chunk_list(matrix_stresses) + "\n")
+                f.write(static_footer)
+                
+            QMessageBox.information(self, "Success", f"DEFORM 3D Keyword file successfully exported:\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to write file:\n{str(e)}")

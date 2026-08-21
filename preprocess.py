@@ -4,7 +4,8 @@ import pandas as pd
 from scipy import interpolate as interp
 from scipy.signal import savgol_filter
 
-from utils import apply_offset_to_flow, detect_end_index
+# Notice apply_offset_to_flow is removed from the import
+from utils import detect_end_index
 
 def safe_savgol(y_data, default_window, polyorder=2):
     """
@@ -20,7 +21,7 @@ def safe_savgol(y_data, default_window, polyorder=2):
         
     return savgol_filter(y_data, window_length=w_len, polyorder=polyorder)
 
-def preprocess_data(data, diameter, height, apply_offset=False, strain_increment=0.005):
+def preprocess_data(data, diameter, height, strain_increment=0.005):
     """
     Preprocess raw compression-test data into resampled flow curves.
     """
@@ -76,9 +77,7 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
 
     data.reset_index(drop=True, inplace=True)
 
-    # -------------------- NEW: SENSOR SETTLING TRIM --------------------
-    # Bypasses anomalous sensor jumps (like Jaw starting at 7.25 then settling to 0)
-    # Finds the true start of the test by locating the minimum Jaw displacement before peak force
+    # -------------------- SENSOR SETTLING TRIM --------------------
     force_vals = data["Force"].values
     jaw_vals = data["Jaw_corr"].values
     peak_force_idx = int(np.argmax(force_vals))
@@ -90,7 +89,6 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
 
     # -------------------- TRUE STRAIN & STRESS --------------------
     denom = (height - data["Jaw_corr"])
-    # Prevent divide-by-zero or negative logs if correction overshoots
     denom = np.clip(denom, 0.001, None) 
 
     data["x"] = -np.log(denom / height)
@@ -117,7 +115,6 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
             temp_raw = temp_raw[:cut]
 
     # -------------------- 2. MONOTONIC STRAIN FILTER --------------------
-    # Drops backwards noise points safely instead of scrambling the timeline
     running_max = np.maximum.accumulate(x_raw)
     keep = x_raw >= running_max
     
@@ -129,27 +126,16 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
     if x_raw.size < 5:
         raise ValueError("Not enough valid samples after trimming.")
         
-    # -------------------- 3. APPLY OPTIONAL OFFSET --------------------
     x_stress = x_raw
     y_stress = y_raw
-
-    if apply_offset:
-        df_xy = pd.DataFrame({"x": x_stress, "y": y_stress})
-        df_xy = apply_offset_to_flow(df_xy)
-        x_stress = df_xy["x"].values.astype(float)
-        y_stress = df_xy["y"].values.astype(float)
-
-    if x_stress.size < 5:
-        raise ValueError("Not enough samples after offset removal.")
 
     max_x_stress = float(np.max(x_stress))
     if not np.isfinite(max_x_stress) or max_x_stress <= 0:
         raise ValueError("Invalid strain range after preprocessing.")
 
-    # -------------------- 4. SAFE INTERPOLATION --------------------
+    # -------------------- 3. SAFE INTERPOLATION --------------------
     new_x = _grid_by_dx(max_x_stress, dx)
     
-    # fill_value boundaries prevent the line from extrapolating into negative values
     fY = interp.interp1d(
         x_stress,
         y_stress,
@@ -158,8 +144,7 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
     )
     y_none = fY(new_x)
 
-    # -------------------- 5. FINAL CLIP & EXPORT --------------------
-    # np.clip mathematically guarantees no negative stress values (rings) from the filter
+    # -------------------- 4. FINAL CLIP & EXPORT --------------------
     y_none_safe = np.clip(y_none, 0, None)
     
     result = pd.DataFrame(
@@ -171,7 +156,6 @@ def preprocess_data(data, diameter, height, apply_offset=False, strain_increment
         }
     )
 
-    # Temperature interpolation
     if temp_raw is not None:
         fT = interp.interp1d(
             x_raw,

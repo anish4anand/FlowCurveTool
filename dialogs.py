@@ -33,16 +33,12 @@ class GeometryDialog(QDialog):
 
 
 class PreprocessOptionsDialog(QDialog):
-    def __init__(self, parent=None, default_apply_offset=False, default_strain_increment=0.005):
+    def __init__(self, parent=None, default_strain_increment=0.005):
         super().__init__(parent)
         self.setWindowTitle("Preprocessing Options")
         layout = QVBoxLayout(self)
         
-        self.chk_offset = QCheckBox("Apply elastic offset removal")
-        self.chk_offset.setChecked(default_apply_offset)
-        layout.addWidget(self.chk_offset)
-        
-        # --- NEW: AUTO-AVERAGE CHECKBOX ---
+        # --- AUTO-AVERAGE CHECKBOX ---
         self.chk_average = QCheckBox("Auto-average replicates after processing")
         self.chk_average.setChecked(False) # Defaults to unchecked
         layout.addWidget(self.chk_average)
@@ -57,9 +53,6 @@ class PreprocessOptionsDialog(QDialog):
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
-        
-    def get_apply_offset(self):
-        return self.chk_offset.isChecked()
 
     def get_auto_average(self):
         return self.chk_average.isChecked()

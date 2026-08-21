@@ -1,72 +1,8 @@
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter
+from scipy.optimize import curve_fit
 
-def apply_offset_to_flow(df, strain_offset=0.002):
-    """
-    Remove elastic region using the robust 0.2% Offset Method.
-    Automatically finds the steepest elastic ascent to ignore machine startup noise.
-    """
-    df = df.copy()
-
-    x = df["x"].values.astype(float)
-    y = df["y"].values.astype(float)
-
-    # 1. Smooth data
-    if len(y) > 15:
-        from scipy.signal import savgol_filter
-        y_smooth = savgol_filter(y, window_length=15, polyorder=2)
-    else:
-        y_smooth = y
-        
-    # 2. Find True Elastic Region (The global steepest slope)
-    dx = np.gradient(x)
-    dx[dx == 0] = 1e-12  # Prevent divide-by-zero
-    dy_dx = np.gradient(y_smooth) / dx
-    
-    # Only search the first 20% of the test to avoid end-of-test failure spikes
-    search_limit = max(10, int(len(x) * 0.2))
-    
-    # Ignore first 5 points of raw machine contact noise
-    start_idx = min(5, search_limit - 2) 
-    
-    # The true elastic region is always the steepest ascent!
-    max_slope_idx = start_idx + np.argmax(dy_dx[start_idx:search_limit])
-    
-    # 3. Calculate Modulus (E) around that steepest point
-    fit_window = 3
-    start_fit = max(0, max_slope_idx - fit_window)
-    end_fit = min(len(x), max_slope_idx + fit_window + 1)
-    
-    E, intercept = np.polyfit(x[start_fit:end_fit], y_smooth[start_fit:end_fit], 1)
-
-    # 4. Find Intersection
-    stress_offset = E * (x - strain_offset) + intercept
-    diff = y_smooth - stress_offset  
-    sign_change = np.where(diff[:-1] * diff[1:] < 0)[0]
-    
-    # Only accept crossings that happen AT or AFTER the steepest slope
-    valid_crossings = [idx for idx in sign_change if idx >= max_slope_idx]
-    
-    if len(valid_crossings) > 0:
-        idx_yield = valid_crossings[0] + 1
-    elif len(sign_change) > 0:
-        idx_yield = sign_change[-1] + 1
-    else:
-        print("WARNING: Could not detect 0.2% offset. Defaulting to index 0.")
-        idx_yield = 0
-            
-    # 5. Trim and Re-zero STRAIN ONLY
-    df_cut = df.iloc[idx_yield:].copy().reset_index(drop=True)
-    
-    x0 = df_cut["x"].iloc[0]
-    df_cut["x"] -= x0
-    
-    # IMPORTANT: Do NOT subtract y0 here! Stress must remain absolute for FEM.
-
-    return df_cut
-
-# Replace your current detect_end_index function with this:
 
 def detect_end_index(x: np.ndarray, y: np.ndarray, near_zero_frac=0.05, neg_slope_thresh=0.0, vol_factor=6.0, post_peak_drop_frac=0.40, **kwargs) -> int:
     """
@@ -249,4 +185,106 @@ def force_displacement_curve_from_raw(
         raise ValueError("Force–displacement curve is empty after trimming/cut.")
 
     return out
+
+# EXTRAPOLATION MODELS
+# =====================================================================
+
+def hollomon(epsilon, K, n):
+    return K * epsilon**n
+
+def ludwik(epsilon, sigma_0, K, n):
+    return sigma_0 + K * epsilon**n
+
+def swift(epsilon, epsilon_0, K, n):
+    epsilon_total = epsilon_0 + epsilon
+    epsilon_total = np.maximum(epsilon_total, 1e-8)
+    return K * epsilon_total**n
+
+def voce(epsilon, sigma_inf, sigma_0, m):
+    return sigma_inf + (sigma_0 - sigma_inf) * np.exp(-m * epsilon)
+
+def hockett_sherby(epsilon, sigma_inf, sigma_0, m, p):
+    return sigma_inf - (sigma_inf - sigma_0) * np.exp(-m * epsilon**p)
+
+def fit_extrapolation_models(epsilon, sigma):
+    epsilon = np.maximum(epsilon, 1e-8)
+    results = {}
+    
+    # Safe initial guesses based on data
+    sigma_max = max(np.max(sigma) * 1.2, 1.0)
+    sigma_0 = max(sigma[0], 1.0)
+    
+    # Hollomon
+    try:
+        popt, _ = curve_fit(hollomon, epsilon, sigma, p0=[500, 0.3], bounds=([0, 0], [np.inf, np.inf]), maxfev=20000)
+        results['Hollomon'] = popt
+    except Exception as e:
+        print(f"Hollomon fit failed: {e}")
+        results['Hollomon'] = None
+        
+    # Ludwik
+    try:
+        popt, _ = curve_fit(ludwik, epsilon, sigma, p0=[sigma_0, 50, 0.25], bounds=([0, 0, 0], [np.inf, np.inf, np.inf]), maxfev=20000)
+        results['Ludwik'] = popt
+    except Exception as e:
+        print(f"Ludwik fit failed: {e}")
+        results['Ludwik'] = None
+        
+    # Swift
+    try:
+        popt, _ = curve_fit(swift, epsilon, sigma, p0=[0.01, 50, 0.2], bounds=([0, 0, 0], [np.inf, np.inf, np.inf]), maxfev=20000)
+        results['Swift'] = popt
+    except Exception as e:
+        print(f"Swift fit failed: {e}")
+        results['Swift'] = None
+        
+    # Voce
+    try:
+        popt, _ = curve_fit(voce, epsilon, sigma, p0=[sigma_max, sigma_0, 10], bounds=([0, 0, 0], [np.inf, np.inf, np.inf]), maxfev=20000)
+        results['Voce'] = popt
+    except Exception as e:
+        print(f"Voce fit failed: {e}")
+        results['Voce'] = None
+        
+    # Hockett-Sherby
+    try:
+        popt, _ = curve_fit(hockett_sherby, epsilon, sigma, p0=[sigma_max, sigma_0, 5, 1.0], bounds=([0, 0, 0, 0], [np.inf, np.inf, np.inf, np.inf]), maxfev=20000)
+        results['Hockett-Sherby'] = popt
+    except Exception as e:
+        print(f"Hockett-Sherby fit failed: {e}")
+        results['Hockett-Sherby'] = None
+
+    # Swift+Voce Combination
+    if results['Swift'] is not None and results['Voce'] is not None:
+        def swift_voce(eps, a):
+            return a * swift(eps, *results['Swift']) + (1 - a) * voce(eps, *results['Voce'])
+        try:
+            popt, _ = curve_fit(swift_voce, epsilon, sigma, p0=[0.5], bounds=([0], [1]), maxfev=20000)
+            results['Swift+Voce'] = popt
+        except Exception as e:
+            print(f"Swift+Voce fit failed: {e}")
+            results['Swift+Voce'] = None
+    else:
+        results['Swift+Voce'] = None
+        
+    return results
+
+def evaluate_model(model_name, epsilon, params, swift_params=None, voce_params=None):
+    if params is None:
+        return np.full_like(epsilon, np.nan)
+    
+    if model_name == 'Hollomon':
+        return hollomon(epsilon, *params)
+    elif model_name == 'Ludwik':
+        return ludwik(epsilon, *params)
+    elif model_name == 'Swift':
+        return swift(epsilon, *params)
+    elif model_name == 'Voce':
+        return voce(epsilon, *params)
+    elif model_name == 'Hockett-Sherby':
+        return hockett_sherby(epsilon, *params)
+    elif model_name == 'Swift+Voce':
+        a = params[0]
+        return a * swift(epsilon, *swift_params) + (1 - a) * voce(epsilon, *voce_params)
+    return np.full_like(epsilon, np.nan)
 
